@@ -9,8 +9,10 @@ create table if not exists public.profiles (
     wrapped_secret text not null,        -- base64 ciphertext: secret key encrypted with password-derived key
     wrap_salt text not null,             -- base64 pwhash salt
     wrap_nonce text not null,            -- base64 secretbox nonce
+    last_seen_at timestamptz default now(),
     created_at timestamptz default now()
 );
+alter table public.profiles add column if not exists last_seen_at timestamptz default now();
 
 alter table public.profiles enable row level security;
 
@@ -77,7 +79,12 @@ create policy "chat_files_rw" on storage.objects
     using (bucket_id = 'chat-files')
     with check (bucket_id = 'chat-files');
 
--- 4. auto-delete: scheduled function purges expired rows + their storage blobs
+-- 4. realtime: opt the tables into Supabase's realtime publication so clients
+-- get push notifications for new messages.
+alter publication supabase_realtime add table public.messages;
+alter publication supabase_realtime add table public.profiles;
+
+-- 5. auto-delete: scheduled function purges expired rows + their storage blobs
 create or replace function public.purge_expired_messages()
 returns void language plpgsql security definer as $$
 declare

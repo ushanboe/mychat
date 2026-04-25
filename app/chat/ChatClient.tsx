@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { getSupabase } from "@/lib/supabase";
 import {
@@ -52,6 +52,7 @@ export default function ChatClient() {
     const [me, setMe] = useState<string | null>(null);
     const [peerId, setPeerId] = useState<string | null>(null);
     const [peerEmail, setPeerEmail] = useState<string | null>(null);
+    const [peerLastSeen, setPeerLastSeen] = useState<number | null>(null);
     const [messages, setMessages] = useState<DecryptedMessage[]>([]);
     const [input, setInput] = useState("");
     const [ttlSeconds, setTtlSeconds] = useState<number | null>(null);
@@ -66,6 +67,19 @@ export default function ChatClient() {
         const id = setInterval(() => setNow(Date.now()), 1000);
         return () => clearInterval(id);
     }, []);
+
+    // Heartbeat: stamp our profile.last_seen_at every 25s while the chat is open
+    // so the peer sees us as Online. On tab close the heartbeat stops and we drift
+    // out to "Last seen X ago".
+    useEffect(() => {
+        if (phase !== "ready" || !me) return;
+        const supabase = getSupabase();
+        const beat = () =>
+            supabase.from("profiles").update({ last_seen_at: new Date().toISOString() }).eq("id", me).then(() => {});
+        beat();
+        const id = setInterval(beat, 25_000);
+        return () => clearInterval(id);
+    }, [phase, me]);
 
     const decryptDbRow = useCallback(async (row: DbMessage, sharedKey: Uint8Array, myId: string): Promise<DecryptedMessage | null> => {
         try {
@@ -112,7 +126,7 @@ export default function ChatClient() {
 
         const { data: profiles, error: pErr } = await supabase
             .from("profiles")
-            .select("id, public_key, wrapped_secret, wrap_salt, wrap_nonce");
+            .select("id, public_key, wrapped_secret, wrap_salt, wrap_nonce, last_seen_at");
         if (pErr) throw pErr;
 
         let myProfile = profiles?.find((p) => p.id === myId);
@@ -152,6 +166,7 @@ export default function ChatClient() {
         // Look up peer's email via a Supabase Edge fn? Simpler: skip — we only know their id.
         // We'll show a short id label.
         setPeerEmail(peer.id.slice(0, 8));
+        if (peer.last_seen_at) setPeerLastSeen(new Date(peer.last_seen_at).getTime());
 
         const { data: rows } = await supabase
             .from("messages")
@@ -182,6 +197,14 @@ export default function ChatClient() {
                 (payload) => {
                     const id = (payload.old as { id?: string }).id;
                     if (id) setMessages((prev) => prev.filter((m) => m.id !== id));
+                },
+            )
+            .on(
+                "postgres_changes",
+                { event: "UPDATE", schema: "public", table: "profiles", filter: `id=eq.${peer.id}` },
+                (payload) => {
+                    const row = payload.new as { last_seen_at?: string };
+                    if (row.last_seen_at) setPeerLastSeen(new Date(row.last_seen_at).getTime());
                 },
             )
             .subscribe();
@@ -389,43 +412,60 @@ export default function ChatClient() {
         );
     }
 
+    const peerOnline = peerLastSeen !== null && now - peerLastSeen < 60_000;
+    const peerStatus = peerOnline
+        ? "Online"
+        : peerLastSeen
+            ? `Last seen ${formatRelative(now - peerLastSeen)} ago`
+            : "Offline";
+
     return (
-        <main className="h-screen flex flex-col">
-            <header className="flex items-center justify-between px-4 py-3 border-b border-neutral-800">
-                <div>
-                    <div className="text-sm text-neutral-400">Chatting with</div>
-                    <div className="font-medium">{peerEmail}</div>
+        <main className="flex flex-col h-[100dvh]">
+            <header className="flex-shrink-0 flex items-center justify-between px-3 py-2 border-b border-neutral-800 gap-2">
+                <div className="min-w-0">
+                    <div className="font-medium truncate">{peerEmail}</div>
+                    <div className="flex items-center gap-1.5 text-xs">
+                        <span className={`inline-block w-2 h-2 rounded-full ${peerOnline ? "bg-green-500" : "bg-neutral-600"}`} />
+                        <span className="text-neutral-400 truncate">{peerStatus}</span>
+                    </div>
                 </div>
-                <div className="flex items-center gap-3">
-                    <label className="text-xs text-neutral-400">Auto-delete</label>
+                <div className="flex items-center gap-2 flex-shrink-0">
                     <select
                         value={ttlSeconds ?? ""}
                         onChange={(e) => setTtlSeconds(e.target.value === "" ? null : Number(e.target.value))}
-                        className="bg-neutral-800 text-sm rounded-lg px-2 py-1"
+                        title="Auto-delete messages after"
+                        className="bg-neutral-800 text-xs rounded-lg px-2 py-1"
                     >
                         {TTL_OPTIONS.map((o) => (
-                            <option key={o.label} value={o.seconds ?? ""}>{o.label}</option>
+                            <option key={o.label} value={o.seconds ?? ""}>⏱ {o.label}</option>
                         ))}
                     </select>
-                    <button onClick={signOut} className="text-sm text-neutral-400 hover:text-neutral-100">Sign out</button>
+                    <button onClick={signOut} className="text-xs text-neutral-400 hover:text-neutral-100">Sign out</button>
                 </div>
             </header>
 
-            <div ref={scrollerRef} className="flex-1 overflow-y-auto px-4 py-3 space-y-2">
-                {messages.map((m) => (
-                    <Bubble key={m.id} m={m} now={now} onDownload={() => downloadFile(m)} />
-                ))}
+            <div ref={scrollerRef} className="flex-1 overflow-y-auto px-3 py-3 space-y-2">
+                {messages.map((m, i) => {
+                    const prev = messages[i - 1];
+                    const showDay = !prev || !sameDay(prev.createdAt, m.createdAt);
+                    return (
+                        <Fragment key={m.id}>
+                            {showDay && <DaySeparator timestamp={m.createdAt} />}
+                            <Bubble m={m} now={now} onDownload={() => downloadFile(m)} />
+                        </Fragment>
+                    );
+                })}
                 {errorMsg && <p className="text-sm text-red-400">{errorMsg}</p>}
             </div>
 
             <form
                 onSubmit={(e) => { e.preventDefault(); void sendText(); }}
-                className="border-t border-neutral-800 p-3 flex items-center gap-2"
+                className="flex-shrink-0 border-t border-neutral-800 p-2 flex items-center gap-2 pb-[max(env(safe-area-inset-bottom),0.5rem)]"
             >
                 <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
-                    className="px-3 py-2 rounded-lg bg-neutral-800 hover:bg-neutral-700"
+                    className="px-3 py-2 rounded-lg bg-neutral-800 hover:bg-neutral-700 flex-shrink-0"
                     title="Attach file"
                 >📎</button>
                 <input
@@ -441,10 +481,10 @@ export default function ChatClient() {
                 <input
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
-                    placeholder="Type a message — emojis welcome 😊"
-                    className="flex-1 px-3 py-2 rounded-lg bg-neutral-800 outline-none focus:ring-2 ring-blue-500"
+                    placeholder="Type a message 😊"
+                    className="min-w-0 flex-1 px-3 py-2 rounded-lg bg-neutral-800 outline-none focus:ring-2 ring-blue-500"
                 />
-                <button className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500">Send</button>
+                <button className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 flex-shrink-0">Send</button>
             </form>
         </main>
     );
@@ -464,10 +504,21 @@ function Bubble({ m, now, onDownload }: { m: DecryptedMessage; now: number; onDo
                         <span className="text-xs opacity-70">({Math.round(m.file.size / 1024)} KB)</span>
                     </button>
                 )}
-                {ttl !== null && (
-                    <div className="text-[10px] opacity-70 mt-1">disappears in {formatTtl(ttl)}</div>
-                )}
+                <div className="flex items-center justify-end gap-2 mt-1 text-[10px] opacity-70">
+                    {ttl !== null && <span>disappears in {formatTtl(ttl)}</span>}
+                    <span>{formatTime(m.createdAt)}</span>
+                </div>
             </div>
+        </div>
+    );
+}
+
+function DaySeparator({ timestamp }: { timestamp: number }) {
+    return (
+        <div className="flex items-center justify-center my-3">
+            <span className="text-[11px] uppercase tracking-wider text-neutral-500 bg-neutral-900 px-2 py-1 rounded-full">
+                {formatDay(timestamp)}
+            </span>
         </div>
     );
 }
@@ -479,6 +530,37 @@ function formatTtl(s: number) {
     return `${Math.floor(s / 86400)}d`;
 }
 
+function formatTime(ts: number) {
+    return new Date(ts).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+}
+
+function formatDay(ts: number) {
+    const d = new Date(ts);
+    const today = new Date();
+    const yesterday = new Date();
+    yesterday.setDate(today.getDate() - 1);
+    if (sameDay(d.getTime(), today.getTime())) return "Today";
+    if (sameDay(d.getTime(), yesterday.getTime())) return "Yesterday";
+    return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+}
+
+function sameDay(a: number, b: number) {
+    const da = new Date(a);
+    const db = new Date(b);
+    return da.getFullYear() === db.getFullYear() && da.getMonth() === db.getMonth() && da.getDate() === db.getDate();
+}
+
+function formatRelative(ms: number) {
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h`;
+    const d = Math.floor(h / 24);
+    return `${d}d`;
+}
+
 function Center({ children }: { children: React.ReactNode }) {
-    return <main className="min-h-screen flex items-center justify-center p-6">{children}</main>;
+    return <main className="min-h-[100dvh] flex items-center justify-center p-6">{children}</main>;
 }
