@@ -416,8 +416,8 @@ export default function ChatClient() {
     const peerStatus = peerOnline
         ? "Online"
         : peerLastSeen
-            ? `Last seen ${formatRelative(now - peerLastSeen)} ago`
-            : "Offline";
+            ? `Offline · last seen ${formatLastSeen(peerLastSeen, now)}`
+            : "Unavailable";
 
     return (
         <main className="flex flex-col h-[100dvh]">
@@ -559,6 +559,24 @@ function formatRelative(ms: number) {
     if (h < 24) return `${h}h`;
     const d = Math.floor(h / 24);
     return `${d}d`;
+}
+
+// Status text uses an absolute date/time after a few minutes so the user has
+// concrete context (vs. a vague "3h ago"). Within the first minute we still
+// show seconds so they see the heartbeat lapse in real time.
+function formatLastSeen(ts: number, now: number) {
+    const ms = now - ts;
+    if (ms < 60_000) return `${Math.max(0, Math.floor(ms / 1000))}s ago`;
+    if (ms < 5 * 60_000) return `${Math.floor(ms / 60_000)}m ago`;
+    const d = new Date(ts);
+    const today = new Date(now);
+    const yesterday = new Date(now);
+    yesterday.setDate(today.getDate() - 1);
+    const time = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+    if (sameDay(ts, today.getTime())) return `today at ${time}`;
+    if (sameDay(ts, yesterday.getTime())) return `yesterday at ${time}`;
+    const date = d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    return `${date} at ${time}`;
 }
 
 function Center({ children }: { children: React.ReactNode }) {
