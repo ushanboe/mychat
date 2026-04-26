@@ -45,15 +45,21 @@ const TTL_OPTIONS: { label: string; seconds: number | null }[] = [
     { label: "7 days", seconds: 60 * 60 * 24 * 7 },
 ];
 
-// Translation runs entirely on-device via Chrome's built-in Translator API
-// (Chrome 138+). The "to" code is the user's preferred reading language; the
-// source is assumed to be the *other* code in the pair (en <-> fil).
+// Translation runs entirely on-device via Transformers.js loading our
+// quantized Helsinki-NLP Opus-MT models from /public/models/. Plaintext
+// never leaves the browser. Each direction is ~131 MB on first use, then
+// cached in IndexedDB by the runtime.
 const TRANSLATE_OPTIONS: { label: string; code: string | null }[] = [
     { label: "Off", code: null },
     { label: "→ English", code: "en" },
     { label: "→ Filipino", code: "fil" },
 ];
-const TRANSLATE_PAIR: Record<string, string> = { en: "fil", fil: "en" };
+// target language -> model id under /public/models/
+const TRANSLATE_MODELS: Record<string, string> = {
+    en: "opus-mt-tl-en",
+    fil: "opus-mt-en-tl",
+};
+type TranslationPipe = (text: string, opts?: Record<string, unknown>) => Promise<Array<{ translation_text: string }>>;
 
 export default function ChatClient() {
     const router = useRouter();
@@ -70,11 +76,12 @@ export default function ChatClient() {
     const [now, setNow] = useState(Date.now());
     const [translateTo, setTranslateTo] = useState<string | null>(null);
     const [translations, setTranslations] = useState<Record<string, string>>({});
-    const [translatorOk, setTranslatorOk] = useState(true);
+    const [translatorState, setTranslatorState] = useState<"idle" | "loading" | "ready" | "error">("idle");
+    const [loadProgress, setLoadProgress] = useState<number | null>(null);
     const sharedKeyRef = useRef<Uint8Array | null>(null);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
     const scrollerRef = useRef<HTMLDivElement | null>(null);
-    const translatorsRef = useRef<Map<string, { translate: (s: string) => Promise<string> }>>(new Map());
+    const translatorsRef = useRef<Map<string, TranslationPipe>>(new Map());
 
     // Tick once a second so TTL countdowns + auto-hide work without a re-render storm.
     useEffect(() => {
@@ -82,13 +89,10 @@ export default function ChatClient() {
         return () => clearInterval(id);
     }, []);
 
-    // Restore the user's last translation preference and feature-detect Chrome's
-    // built-in Translator API. We deliberately don't fall back to a cloud API —
-    // staying private means no plaintext leaves the browser.
+    // Restore the user's last translation preference.
     useEffect(() => {
         const stored = localStorage.getItem("mychat_translate_to");
         if (stored) setTranslateTo(stored);
-        setTranslatorOk(typeof (globalThis as { Translator?: unknown }).Translator !== "undefined");
     }, []);
 
     useEffect(() => {
@@ -96,46 +100,60 @@ export default function ChatClient() {
         else localStorage.removeItem("mychat_translate_to");
     }, [translateTo]);
 
-    // Translate any new peer messages into the user's preferred language. Caches
-    // both the translator instance per direction and each message's result so we
-    // don't re-translate on every render.
+    // Translate any new peer messages into the user's preferred language using
+    // an on-device Transformers.js pipeline. The model is fetched from
+    // /public/models/ on first use (~131 MB) and cached in IndexedDB by the
+    // runtime, so subsequent loads are instant. Plaintext never leaves the tab.
     useEffect(() => {
-        if (!translateTo || !translatorOk) return;
-        const source = TRANSLATE_PAIR[translateTo];
-        if (!source) return;
+        if (!translateTo) { setTranslatorState("idle"); setLoadProgress(null); return; }
+        const modelId = TRANSLATE_MODELS[translateTo];
+        if (!modelId) return;
         const pending = messages.filter((m) => !m.mine && m.text && !(m.id in translations));
-        if (pending.length === 0) return;
+        if (pending.length === 0 && translatorsRef.current.has(modelId)) return;
         let cancelled = false;
         (async () => {
-            const TranslatorCtor = (globalThis as { Translator?: {
-                availability: (o: { sourceLanguage: string; targetLanguage: string }) => Promise<string>;
-                create: (o: { sourceLanguage: string; targetLanguage: string }) => Promise<{ translate: (s: string) => Promise<string> }>;
-            } }).Translator;
-            if (!TranslatorCtor) { setTranslatorOk(false); return; }
-            const key = `${source}->${translateTo}`;
-            let t = translatorsRef.current.get(key);
-            if (!t) {
+            let pipe = translatorsRef.current.get(modelId);
+            if (!pipe) {
                 try {
-                    const avail = await TranslatorCtor.availability({ sourceLanguage: source, targetLanguage: translateTo });
-                    if (avail === "unavailable") { setTranslatorOk(false); return; }
-                    t = await TranslatorCtor.create({ sourceLanguage: source, targetLanguage: translateTo });
-                    translatorsRef.current.set(key, t);
-                } catch {
-                    setTranslatorOk(false);
+                    setTranslatorState("loading");
+                    setLoadProgress(0);
+                    const tjs = await import("@huggingface/transformers");
+                    tjs.env.allowLocalModels = true;
+                    tjs.env.allowRemoteModels = false;
+                    tjs.env.localModelPath = "/models/";
+                    pipe = (await tjs.pipeline("translation", modelId, {
+                        dtype: "q8",
+                        progress_callback: (p: { status?: string; progress?: number }) => {
+                            if (cancelled) return;
+                            if (p.status === "progress" && typeof p.progress === "number") {
+                                setLoadProgress(Math.round(p.progress));
+                            }
+                        },
+                    })) as unknown as TranslationPipe;
+                    if (cancelled) return;
+                    translatorsRef.current.set(modelId, pipe);
+                    setTranslatorState("ready");
+                    setLoadProgress(null);
+                } catch (e) {
+                    console.error("[translator] load failed:", e);
+                    if (!cancelled) { setTranslatorState("error"); setLoadProgress(null); }
                     return;
                 }
             }
             const next: Record<string, string> = {};
             for (const m of pending) {
                 if (cancelled) return;
-                try { next[m.id] = await t.translate(m.text!); } catch { /* skip individual failures */ }
+                try {
+                    const out = await pipe(m.text!, { max_new_tokens: 256 });
+                    next[m.id] = out[0]?.translation_text ?? "";
+                } catch { /* skip individual failures */ }
             }
             if (!cancelled && Object.keys(next).length) {
                 setTranslations((prev) => ({ ...prev, ...next }));
             }
         })();
         return () => { cancelled = true; };
-    }, [messages, translateTo, translatorOk, translations]);
+    }, [messages, translateTo, translations]);
 
     // Heartbeat: stamp our profile.last_seen_at every 25s while the chat is open
     // so the peer sees us as Online. On tab close the heartbeat stops and we drift
@@ -522,9 +540,14 @@ export default function ChatClient() {
                     <button onClick={signOut} className="text-xs text-neutral-400 hover:text-neutral-100">Sign out</button>
                 </div>
             </header>
-            {translateTo && !translatorOk && (
+            {translateTo && translatorState === "loading" && (
+                <div className="flex-shrink-0 text-[11px] text-blue-200 bg-blue-950/40 border-b border-blue-900 px-3 py-1">
+                    Loading translation model{loadProgress !== null ? ` (${loadProgress}%)` : ""}… first time downloads ~131&nbsp;MB, then cached.
+                </div>
+            )}
+            {translateTo && translatorState === "error" && (
                 <div className="flex-shrink-0 text-[11px] text-amber-300 bg-amber-950/40 border-b border-amber-900 px-3 py-1">
-                    On-device translator unavailable in this browser. Use Chrome 138+ on desktop, or set translation to Off.
+                    Translation model failed to load. Check the browser console, or set translation to Off.
                 </div>
             )}
 

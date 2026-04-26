@@ -9,6 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
     "@supabase/ssr": "^0.5.2",
     "@supabase/supabase-js": "^2.45.4",
     "libsodium-wrappers": "^0.8.4",
