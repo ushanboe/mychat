@@ -45,6 +45,16 @@ const TTL_OPTIONS: { label: string; seconds: number | null }[] = [
     { label: "7 days", seconds: 60 * 60 * 24 * 7 },
 ];
 
+// Translation runs entirely on-device via Chrome's built-in Translator API
+// (Chrome 138+). The "to" code is the user's preferred reading language; the
+// source is assumed to be the *other* code in the pair (en <-> fil).
+const TRANSLATE_OPTIONS: { label: string; code: string | null }[] = [
+    { label: "Off", code: null },
+    { label: "→ English", code: "en" },
+    { label: "→ Filipino", code: "fil" },
+];
+const TRANSLATE_PAIR: Record<string, string> = { en: "fil", fil: "en" };
+
 export default function ChatClient() {
     const router = useRouter();
     const [phase, setPhase] = useState<"loading" | "needs-password" | "ready" | "no-peer">("loading");
@@ -58,15 +68,74 @@ export default function ChatClient() {
     const [ttlSeconds, setTtlSeconds] = useState<number | null>(null);
     const [pwPrompt, setPwPrompt] = useState("");
     const [now, setNow] = useState(Date.now());
+    const [translateTo, setTranslateTo] = useState<string | null>(null);
+    const [translations, setTranslations] = useState<Record<string, string>>({});
+    const [translatorOk, setTranslatorOk] = useState(true);
     const sharedKeyRef = useRef<Uint8Array | null>(null);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
     const scrollerRef = useRef<HTMLDivElement | null>(null);
+    const translatorsRef = useRef<Map<string, { translate: (s: string) => Promise<string> }>>(new Map());
 
     // Tick once a second so TTL countdowns + auto-hide work without a re-render storm.
     useEffect(() => {
         const id = setInterval(() => setNow(Date.now()), 1000);
         return () => clearInterval(id);
     }, []);
+
+    // Restore the user's last translation preference and feature-detect Chrome's
+    // built-in Translator API. We deliberately don't fall back to a cloud API —
+    // staying private means no plaintext leaves the browser.
+    useEffect(() => {
+        const stored = localStorage.getItem("mychat_translate_to");
+        if (stored) setTranslateTo(stored);
+        setTranslatorOk(typeof (globalThis as { Translator?: unknown }).Translator !== "undefined");
+    }, []);
+
+    useEffect(() => {
+        if (translateTo) localStorage.setItem("mychat_translate_to", translateTo);
+        else localStorage.removeItem("mychat_translate_to");
+    }, [translateTo]);
+
+    // Translate any new peer messages into the user's preferred language. Caches
+    // both the translator instance per direction and each message's result so we
+    // don't re-translate on every render.
+    useEffect(() => {
+        if (!translateTo || !translatorOk) return;
+        const source = TRANSLATE_PAIR[translateTo];
+        if (!source) return;
+        const pending = messages.filter((m) => !m.mine && m.text && !(m.id in translations));
+        if (pending.length === 0) return;
+        let cancelled = false;
+        (async () => {
+            const TranslatorCtor = (globalThis as { Translator?: {
+                availability: (o: { sourceLanguage: string; targetLanguage: string }) => Promise<string>;
+                create: (o: { sourceLanguage: string; targetLanguage: string }) => Promise<{ translate: (s: string) => Promise<string> }>;
+            } }).Translator;
+            if (!TranslatorCtor) { setTranslatorOk(false); return; }
+            const key = `${source}->${translateTo}`;
+            let t = translatorsRef.current.get(key);
+            if (!t) {
+                try {
+                    const avail = await TranslatorCtor.availability({ sourceLanguage: source, targetLanguage: translateTo });
+                    if (avail === "unavailable") { setTranslatorOk(false); return; }
+                    t = await TranslatorCtor.create({ sourceLanguage: source, targetLanguage: translateTo });
+                    translatorsRef.current.set(key, t);
+                } catch {
+                    setTranslatorOk(false);
+                    return;
+                }
+            }
+            const next: Record<string, string> = {};
+            for (const m of pending) {
+                if (cancelled) return;
+                try { next[m.id] = await t.translate(m.text!); } catch { /* skip individual failures */ }
+            }
+            if (!cancelled && Object.keys(next).length) {
+                setTranslations((prev) => ({ ...prev, ...next }));
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [messages, translateTo, translatorOk, translations]);
 
     // Heartbeat: stamp our profile.last_seen_at every 25s while the chat is open
     // so the peer sees us as Online. On tab close the heartbeat stops and we drift
@@ -431,6 +500,16 @@ export default function ChatClient() {
                 </div>
                 <div className="flex items-center gap-2 flex-shrink-0">
                     <select
+                        value={translateTo ?? ""}
+                        onChange={(e) => setTranslateTo(e.target.value || null)}
+                        title="Translate incoming messages on-device (Chrome 138+)"
+                        className="bg-neutral-800 text-xs rounded-lg px-2 py-1"
+                    >
+                        {TRANSLATE_OPTIONS.map((o) => (
+                            <option key={o.label} value={o.code ?? ""}>🌐 {o.label}</option>
+                        ))}
+                    </select>
+                    <select
                         value={ttlSeconds ?? ""}
                         onChange={(e) => setTtlSeconds(e.target.value === "" ? null : Number(e.target.value))}
                         title="Auto-delete messages after"
@@ -443,6 +522,11 @@ export default function ChatClient() {
                     <button onClick={signOut} className="text-xs text-neutral-400 hover:text-neutral-100">Sign out</button>
                 </div>
             </header>
+            {translateTo && !translatorOk && (
+                <div className="flex-shrink-0 text-[11px] text-amber-300 bg-amber-950/40 border-b border-amber-900 px-3 py-1">
+                    On-device translator unavailable in this browser. Use Chrome 138+ on desktop, or set translation to Off.
+                </div>
+            )}
 
             <div ref={scrollerRef} className="flex-1 overflow-y-auto px-3 py-3 space-y-2">
                 {messages.map((m, i) => {
@@ -451,7 +535,7 @@ export default function ChatClient() {
                     return (
                         <Fragment key={m.id}>
                             {showDay && <DaySeparator timestamp={m.createdAt} />}
-                            <Bubble m={m} now={now} onDownload={() => downloadFile(m)} />
+                            <Bubble m={m} now={now} translation={translations[m.id]} onDownload={() => downloadFile(m)} />
                         </Fragment>
                     );
                 })}
@@ -490,7 +574,7 @@ export default function ChatClient() {
     );
 }
 
-function Bubble({ m, now, onDownload }: { m: DecryptedMessage; now: number; onDownload: () => void }) {
+function Bubble({ m, now, translation, onDownload }: { m: DecryptedMessage; now: number; translation?: string; onDownload: () => void }) {
     const align = m.mine ? "justify-end" : "justify-start";
     const bg = m.mine ? "bg-blue-600" : "bg-neutral-800";
     const ttl = m.expiresAt ? Math.max(0, Math.floor((m.expiresAt - now) / 1000)) : null;
@@ -498,6 +582,11 @@ function Bubble({ m, now, onDownload }: { m: DecryptedMessage; now: number; onDo
         <div className={`flex ${align}`}>
             <div className={`max-w-[75%] ${bg} px-3 py-2 rounded-2xl`}>
                 {m.text && <div className="whitespace-pre-wrap break-words">{m.text}</div>}
+                {translation && (
+                    <div className="mt-1 pt-1 border-t border-white/10 text-xs italic opacity-80 whitespace-pre-wrap break-words">
+                        🌐 {translation}
+                    </div>
+                )}
                 {m.file && (
                     <button onClick={onDownload} className="flex items-center gap-2 underline">
                         📄 {m.file.name}
