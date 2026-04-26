@@ -32,10 +32,17 @@ type DecryptedMessage = {
     id: string;
     mine: boolean;
     text?: string;
+    translation?: string;
+    translationLang?: string;
     file?: FileMeta & { path: string; fileNonce: string };
     createdAt: number;
     expiresAt: number | null;
 };
+
+// Wire format for text messages once translation is enabled. Plain string
+// payloads from older messages still decode correctly (we fall back to
+// treating the raw decrypted text as the message body).
+type TextPayload = { text: string; translation?: string; lang?: string };
 
 const TTL_OPTIONS: { label: string; seconds: number | null }[] = [
     { label: "Off", seconds: null },
@@ -75,13 +82,48 @@ export default function ChatClient() {
     const [pwPrompt, setPwPrompt] = useState("");
     const [now, setNow] = useState(Date.now());
     const [translateTo, setTranslateTo] = useState<string | null>(null);
-    const [translations, setTranslations] = useState<Record<string, string>>({});
     const [translatorState, setTranslatorState] = useState<"idle" | "loading" | "ready" | "error">("idle");
     const [loadProgress, setLoadProgress] = useState<number | null>(null);
+    const [translatingNow, setTranslatingNow] = useState(false);
     const sharedKeyRef = useRef<Uint8Array | null>(null);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
     const scrollerRef = useRef<HTMLDivElement | null>(null);
     const translatorsRef = useRef<Map<string, TranslationPipe>>(new Map());
+
+    // Lazy-load (or return cached) the translation pipeline for the given
+    // target language. Called both on toggle (to warm up) and from sendText
+    // (to translate the user's outgoing message before it leaves the tab).
+    const loadTranslator = useCallback(async (target: string): Promise<TranslationPipe | null> => {
+        const modelId = TRANSLATE_MODELS[target];
+        if (!modelId) return null;
+        const cached = translatorsRef.current.get(modelId);
+        if (cached) return cached;
+        try {
+            setTranslatorState("loading");
+            setLoadProgress(0);
+            const tjs = await import("@huggingface/transformers");
+            tjs.env.allowLocalModels = true;
+            tjs.env.allowRemoteModels = false;
+            tjs.env.localModelPath = "/models/";
+            const pipe = (await tjs.pipeline("translation", modelId, {
+                dtype: "q8",
+                progress_callback: (p: { status?: string; progress?: number }) => {
+                    if (p.status === "progress" && typeof p.progress === "number") {
+                        setLoadProgress(Math.round(p.progress));
+                    }
+                },
+            })) as unknown as TranslationPipe;
+            translatorsRef.current.set(modelId, pipe);
+            setTranslatorState("ready");
+            setLoadProgress(null);
+            return pipe;
+        } catch (e) {
+            console.error("[translator] load failed:", e);
+            setTranslatorState("error");
+            setLoadProgress(null);
+            return null;
+        }
+    }, []);
 
     // Tick once a second so TTL countdowns + auto-hide work without a re-render storm.
     useEffect(() => {
@@ -100,68 +142,13 @@ export default function ChatClient() {
         else localStorage.removeItem("mychat_translate_to");
     }, [translateTo]);
 
-    // Translate any new peer messages into the user's preferred language using
-    // an on-device Transformers.js pipeline. The model is fetched from
-    // /public/models/ on first use (~131 MB) and cached in IndexedDB by the
-    // runtime, so subsequent loads are instant. Plaintext never leaves the tab.
+    // Warm up the translation pipeline as soon as the user picks a target
+    // language. This pays the ~131 MB first-time download cost up front so
+    // that send-time translation is instant.
     useEffect(() => {
         if (!translateTo) { setTranslatorState("idle"); setLoadProgress(null); return; }
-        const modelId = TRANSLATE_MODELS[translateTo];
-        if (!modelId) return;
-        const pending = messages.filter((m) => !m.mine && m.text && !(m.id in translations));
-        if (pending.length === 0 && translatorsRef.current.has(modelId)) return;
-        let cancelled = false;
-        (async () => {
-            let pipe = translatorsRef.current.get(modelId);
-            if (!pipe) {
-                try {
-                    setTranslatorState("loading");
-                    setLoadProgress(0);
-                    const tjs = await import("@huggingface/transformers");
-                    tjs.env.allowLocalModels = true;
-                    tjs.env.allowRemoteModels = false;
-                    tjs.env.localModelPath = "/models/";
-                    pipe = (await tjs.pipeline("translation", modelId, {
-                        dtype: "q8",
-                        progress_callback: (p: { status?: string; progress?: number }) => {
-                            if (cancelled) return;
-                            if (p.status === "progress" && typeof p.progress === "number") {
-                                setLoadProgress(Math.round(p.progress));
-                            }
-                        },
-                    })) as unknown as TranslationPipe;
-                    if (cancelled) return;
-                    translatorsRef.current.set(modelId, pipe);
-                    setTranslatorState("ready");
-                    setLoadProgress(null);
-                } catch (e) {
-                    console.error("[translator] load failed:", e);
-                    if (!cancelled) { setTranslatorState("error"); setLoadProgress(null); }
-                    return;
-                }
-            }
-            const next: Record<string, string> = {};
-            for (const m of pending) {
-                if (cancelled) return;
-                try {
-                    const raw = await pipe(m.text!, { max_new_tokens: 256 });
-                    const first = Array.isArray(raw) ? raw[0] : raw;
-                    const text = (first as { translation_text?: string; generated_text?: string })
-                        ?.translation_text
-                        ?? (first as { generated_text?: string })?.generated_text
-                        ?? "";
-                    if (text) next[m.id] = text;
-                    else console.warn("[translator] empty result for", m.id, "raw=", raw);
-                } catch (e) {
-                    console.error("[translator] translate failed for", m.id, e);
-                }
-            }
-            if (!cancelled && Object.keys(next).length) {
-                setTranslations((prev) => ({ ...prev, ...next }));
-            }
-        })();
-        return () => { cancelled = true; };
-    }, [messages, translateTo, translations]);
+        loadTranslator(translateTo);
+    }, [translateTo, loadTranslator]);
 
     // Heartbeat: stamp our profile.last_seen_at every 25s while the chat is open
     // so the peer sees us as Online. On tab close the heartbeat stops and we drift
@@ -185,8 +172,19 @@ export default function ChatClient() {
                 expiresAt: row.expires_at ? new Date(row.expires_at).getTime() : null,
             };
             if (row.kind === "text") {
-                const text = await decryptText({ ciphertext: row.ciphertext, nonce: row.nonce }, sharedKey);
-                return { ...base, text };
+                const raw = await decryptText({ ciphertext: row.ciphertext, nonce: row.nonce }, sharedKey);
+                let text = raw;
+                let translation: string | undefined;
+                let translationLang: string | undefined;
+                try {
+                    const parsed = JSON.parse(raw) as Partial<TextPayload>;
+                    if (parsed && typeof parsed.text === "string") {
+                        text = parsed.text;
+                        if (typeof parsed.translation === "string") translation = parsed.translation;
+                        if (typeof parsed.lang === "string") translationLang = parsed.lang;
+                    }
+                } catch { /* legacy plain-text payload */ }
+                return { ...base, text, translation, translationLang };
             }
             // file: ciphertext column carries encrypted JSON metadata; nonce decrypts it.
             // The encrypted blob lives in storage at row.file_path with a nonce stored
@@ -376,12 +374,32 @@ export default function ChatClient() {
 
     async function sendText() {
         if (!input.trim() || !sharedKeyRef.current || !me || !peerId) return;
+        const text = input;
+        setInput("");
         const supabase = getSupabase();
-        const { ciphertext, nonce } = await encryptText(input, sharedKeyRef.current);
+        const payload: TextPayload = { text };
+        if (translateTo) {
+            setTranslatingNow(true);
+            try {
+                const pipe = await loadTranslator(translateTo);
+                if (pipe) {
+                    const raw = await pipe(text, { max_new_tokens: 256 });
+                    const first = Array.isArray(raw) ? raw[0] : raw;
+                    const tr = (first as { translation_text?: string; generated_text?: string })
+                        ?.translation_text
+                        ?? (first as { generated_text?: string })?.generated_text;
+                    if (tr) { payload.translation = tr; payload.lang = translateTo; }
+                }
+            } catch (e) {
+                console.error("[translator] send-time translate failed:", e);
+            } finally {
+                setTranslatingNow(false);
+            }
+        }
+        const { ciphertext, nonce } = await encryptText(JSON.stringify(payload), sharedKeyRef.current);
         const expires_at = ttlSeconds
             ? new Date(Date.now() + ttlSeconds * 1000).toISOString()
             : null;
-        setInput("");
         const { error } = await supabase.from("messages").insert({
             sender: me,
             recipient: peerId,
@@ -566,7 +584,7 @@ export default function ChatClient() {
                     return (
                         <Fragment key={m.id}>
                             {showDay && <DaySeparator timestamp={m.createdAt} />}
-                            <Bubble m={m} now={now} translation={translations[m.id]} onDownload={() => downloadFile(m)} />
+                            <Bubble m={m} now={now} onDownload={() => downloadFile(m)} />
                         </Fragment>
                     );
                 })}
@@ -599,13 +617,16 @@ export default function ChatClient() {
                     placeholder="Type a message 😊"
                     className="min-w-0 flex-1 px-3 py-2 rounded-lg bg-neutral-800 outline-none focus:ring-2 ring-blue-500"
                 />
-                <button className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 flex-shrink-0">Send</button>
+                <button
+                    disabled={translatingNow}
+                    className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:bg-blue-900 disabled:cursor-wait flex-shrink-0"
+                >{translatingNow ? "🌐…" : "Send"}</button>
             </form>
         </main>
     );
 }
 
-function Bubble({ m, now, translation, onDownload }: { m: DecryptedMessage; now: number; translation?: string; onDownload: () => void }) {
+function Bubble({ m, now, onDownload }: { m: DecryptedMessage; now: number; onDownload: () => void }) {
     const align = m.mine ? "justify-end" : "justify-start";
     const bg = m.mine ? "bg-blue-600" : "bg-neutral-800";
     const ttl = m.expiresAt ? Math.max(0, Math.floor((m.expiresAt - now) / 1000)) : null;
@@ -613,9 +634,9 @@ function Bubble({ m, now, translation, onDownload }: { m: DecryptedMessage; now:
         <div className={`flex ${align}`}>
             <div className={`max-w-[75%] ${bg} px-3 py-2 rounded-2xl`}>
                 {m.text && <div className="whitespace-pre-wrap break-words">{m.text}</div>}
-                {translation && (
+                {m.translation && (
                     <div className="mt-1 pt-1 border-t border-white/10 text-xs italic opacity-80 whitespace-pre-wrap break-words">
-                        🌐 {translation}
+                        🌐 {m.translation}
                     </div>
                 )}
                 {m.file && (
