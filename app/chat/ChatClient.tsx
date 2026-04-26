@@ -144,9 +144,17 @@ export default function ChatClient() {
             for (const m of pending) {
                 if (cancelled) return;
                 try {
-                    const out = await pipe(m.text!, { max_new_tokens: 256 });
-                    next[m.id] = out[0]?.translation_text ?? "";
-                } catch { /* skip individual failures */ }
+                    const raw = await pipe(m.text!, { max_new_tokens: 256 });
+                    const first = Array.isArray(raw) ? raw[0] : raw;
+                    const text = (first as { translation_text?: string; generated_text?: string })
+                        ?.translation_text
+                        ?? (first as { generated_text?: string })?.generated_text
+                        ?? "";
+                    if (text) next[m.id] = text;
+                    else console.warn("[translator] empty result for", m.id, "raw=", raw);
+                } catch (e) {
+                    console.error("[translator] translate failed for", m.id, e);
+                }
             }
             if (!cancelled && Object.keys(next).length) {
                 setTranslations((prev) => ({ ...prev, ...next }));
